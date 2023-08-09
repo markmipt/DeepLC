@@ -33,11 +33,16 @@ import sys
 import copy
 import gc
 import logging
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import multiprocessing
 import multiprocessing.dummy
 import pickle
 import warnings
 from configparser import ConfigParser
+from scipy.stats import scoreatpercentile
+from scipy.optimize import curve_fit
+from scipy import exp
 
 
 # If CLI/GUI/frozen: disable Tensorflow info and warnings before importing
@@ -120,6 +125,40 @@ def reset_keras():
     gc.collect()
     # Set to force CPU calculations
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+
+
+def calibrate_RT_gaus_full(rt_diff_tmp):
+    RT_left = -min(rt_diff_tmp)
+    RT_right = max(rt_diff_tmp)
+
+    try:
+        start_width = (scoreatpercentile(rt_diff_tmp, 95) - scoreatpercentile(rt_diff_tmp, 5)) / 100
+        XRT_shift, XRT_sigma, covvalue = calibrate_RT_gaus(start_width, RT_left, RT_right, rt_diff_tmp)
+    except:
+        start_width = (scoreatpercentile(rt_diff_tmp, 95) - scoreatpercentile(rt_diff_tmp, 5)) / 50
+        XRT_shift, XRT_sigma, covvalue = calibrate_RT_gaus(start_width, RT_left, RT_right, rt_diff_tmp)
+    if np.isinf(covvalue):
+        XRT_shift, XRT_sigma, covvalue = calibrate_RT_gaus(0.1, RT_left, RT_right, rt_diff_tmp)
+    if np.isinf(covvalue):
+        XRT_shift, XRT_sigma, covvalue = calibrate_RT_gaus(1.0, RT_left, RT_right, rt_diff_tmp)
+    return XRT_shift, XRT_sigma, covvalue
+
+def calibrate_RT_gaus(bwidth, mass_left, mass_right, true_md):
+
+    bbins = np.arange(-mass_left, mass_right, bwidth)
+    H1, b1 = np.histogram(true_md, bins=bbins)
+    b1 = b1 + bwidth
+    b1 = b1[:-1]
+
+
+    popt, pcov = curve_fit(noisygaus, b1, H1, p0=[1, np.median(true_md), bwidth * 5, 1])
+    mass_shift, mass_sigma = popt[1], abs(popt[2])
+    return mass_shift, mass_sigma, pcov[0][0]
+
+def noisygaus(x, a, x0, sigma, b):
+    return a * exp(-(x - x0) ** 2 / (2 * sigma ** 2)) + b
+
 
 class DeepLC():
     """
@@ -272,6 +311,35 @@ class DeepLC():
                   |_|
               """)
 
+
+    def extract_custom(self, seq_df):
+        if self.cnn_model:
+            if self.verbose:
+                logger.debug("Extracting features for the CNN model ...")
+            X = self.do_f_extraction_pd_parallel(seq_df)
+            X = X.loc[seq_df.index]
+
+            X_sum = np.stack(X["matrix_sum"])
+            X_global = np.concatenate((np.stack(X["matrix_all"]),
+                                    np.stack(X["pos_matrix"])),
+                                    axis=1)
+            X_hc = np.stack(X["matrix_hc"])
+            X = np.stack(X["matrix"])
+        else:
+            if self.verbose:
+                logger.debug(
+                    "Extracting features for the predictive model ...")
+            seq_df.index
+            X = self.do_f_extraction_pd_parallel(seq_df)
+            X = X.loc[seq_df.index]
+
+            X = X[self.model.feature_names]
+            X_sum = None
+            X_global = None
+            X_hc = None
+        return X, X_sum, X_global, X_hc
+
+
     def do_f_extraction(self,
                         seqs,
                         mods,
@@ -406,7 +474,8 @@ class DeepLC():
                         identifiers=[],
                         calibrate=True,
                         correction_factor=1.0,
-                        mod_name=None):
+                        mod_name=None,
+                        X_custom_list=None):
         """
         Make predictions for sequences
 
@@ -461,10 +530,13 @@ class DeepLC():
         if isinstance(self.model, dict):
             all_mods = [m_name for m_group_name,m_name in self.model.items()]
 
-        # TODO check if .keys() object is the same as set (or at least for set operations)
-        idents_in_lib = set(LIBRARY.keys())
 
         if self.use_library:
+
+
+            # TODO check if .keys() object is the same as set (or at least for set operations)
+            idents_in_lib = set(LIBRARY.keys())
+
             for ident in seq_df["idents"]:
                 if isinstance(self.model, dict):
                     spec_ident = all_mods
@@ -509,28 +581,14 @@ class DeepLC():
             cnn_verbose = 0
 
         # If we need to apply deep NN
+
+
         if len(seq_df.index) > 0:
-            if self.cnn_model:
-                if self.verbose:
-                    logger.debug("Extracting features for the CNN model ...")
-                X = self.do_f_extraction_pd_parallel(seq_df)
-                X = X.loc[seq_df.index]
 
-                X_sum = np.stack(X["matrix_sum"])
-                X_global = np.concatenate((np.stack(X["matrix_all"]),
-                                        np.stack(X["pos_matrix"])),
-                                        axis=1)
-                X_hc = np.stack(X["matrix_hc"])
-                X = np.stack(X["matrix"])
+            if X_custom_list is not None:
+                X, X_sum, X_global, X_hc = X_custom_list
             else:
-                if self.verbose:
-                    logger.debug(
-                        "Extracting features for the predictive model ...")
-                seq_df.index
-                X = self.do_f_extraction_pd_parallel(seq_df)
-                X = X.loc[seq_df.index]
-
-                X = X[self.model.feature_names]
+                X, X_sum, X_global, X_hc = self.extract_custom(seq_df)
 
         ret_preds = []
         ret_preds2 = []
@@ -555,12 +613,14 @@ class DeepLC():
                     for m_group_name,m_name in self.model.items():
                         try:
                             X
+                            clear_session()
                             mod = load_model(
                                 m_name,
+                                compile=False,
                                 custom_objects={'<lambda>': lrelu}
                             )
                             uncal_preds = mod.predict(
-                                [X, X_sum, X_global, X_hc], batch_size=5120).flatten() / correction_factor
+                                [X, X_sum, X_global, X_hc], batch_size=5120, verbose=0).flatten() / correction_factor
                         except UnboundLocalError:
                             logger.debug("X is empty, skipping...")
                             uncal_preds = []
@@ -598,22 +658,26 @@ class DeepLC():
                     ret_preds2 = np.array([sum(a)/len(a) for a in zip(*ret_preds2)])
                 elif not mod_name:
                     # No library write!
+                    clear_session()
                     mod = load_model(
                         self.model,
+                        compile=False,
                         custom_objects={'<lambda>': lrelu}
                     )
                     uncal_preds = mod.predict(
-                        [X, X_sum, X_global, X_hc], batch_size=5120).flatten() / correction_factor
+                        [X, X_sum, X_global, X_hc], batch_size=5120, verbose=0).flatten() / correction_factor
                     ret_preds = self.calibration_core(uncal_preds,self.calibrate_dict,self.calibrate_min,self.calibrate_max)
                 else:
+                    clear_session()
                     mod = load_model(
                         mod_name,
+                        compile=False,
                         custom_objects={'<lambda>': lrelu}
                     )
                     try:
                         X
                         uncal_preds = mod.predict(
-                            [X, X_sum, X_global, X_hc], batch_size=5120).flatten() / correction_factor
+                            [X, X_sum, X_global, X_hc], batch_size=5120, verbose=0).flatten() / correction_factor
                     except UnboundLocalError:
                         logger.debug("X is empty, skipping...")
                         uncal_preds = []
@@ -638,7 +702,7 @@ class DeepLC():
                     ret_preds2.extend(p2)
             else:
                 # first get uncalibrated prediction
-                uncal_preds = self.model.predict(X) / correction_factor
+                uncal_preds = self.model.predict(X, verbose=0) / correction_factor
 
                 if self.write_library:
                     try:
@@ -663,12 +727,14 @@ class DeepLC():
                         for m_group_name,m_name in self.model.items():
                             try:
                                 X
+                                clear_session()
                                 mod = load_model(
                                     m_name,
+                                    compile=False,
                                     custom_objects={'<lambda>': lrelu}
                                 )
                                 p = mod.predict(
-                                    [X, X_sum, X_global, X_hc], batch_size=5120).flatten() / correction_factor
+                                    [X, X_sum, X_global, X_hc], batch_size=5120, verbose=0).flatten() / correction_factor
                                 ret_preds.append(p)
                             except UnboundLocalError:
                                 logger.debug("X is empty, skipping...")
@@ -693,8 +759,10 @@ class DeepLC():
                         ret_preds2 = np.array([sum(a)/len(a) for a in zip(*ret_preds2)])
                     elif isinstance(self.model, list):
                         mod_name = self.model[0]
+                        clear_session()
                         mod = load_model(
                             mod_name,
+                            compile=False,
                             custom_objects={'<lambda>': lrelu}
                         )
                         ret_preds = mod.predict([X,
@@ -718,8 +786,10 @@ class DeepLC():
                     elif isinstance(self.model, str):
                         # No library write!
                         mod_name = self.model
+                        clear_session()
                         mod = load_model(
                             mod_name,
+                            compile=False,
                             custom_objects={'<lambda>': lrelu}
                         )
                         ret_preds = mod.predict([X,
@@ -745,8 +815,10 @@ class DeepLC():
                         raise DeepLCError('No CNN model defined.')
                 else:
                     # No library write!
+                    clear_session()
                     mod = load_model(
                         mod_name,
+                        compile=False,
                         custom_objects={'<lambda>': lrelu}
                     )
                     try:
@@ -773,7 +845,7 @@ class DeepLC():
 
             else:
                 # No library write!
-                ret_preds = self.model.predict(X) / correction_factor
+                ret_preds = self.model.predict(X, verbose=0) / correction_factor
 
         pred_dict = dict(zip(seq_df["idents"], ret_preds))
 
@@ -791,7 +863,7 @@ class DeepLC():
 
         # Below can cause freezing on some systems
         # It is meant to clear any remaining vars in memory
-        reset_keras()
+        # reset_keras()
         try:
             del mod
         except UnboundLocalError:
@@ -802,8 +874,10 @@ class DeepLC():
             for m_name in deepcallc_x.keys():
                 deepcallc_x[m_name] = [deepcallc_x[m_name][ident] for ident in seq_mod_comb]
 
-            ret_preds_shape = self.deepcallc_model.predict(pd.DataFrame(deepcallc_x))
+            ret_preds_shape = self.deepcallc_model.predict(pd.DataFrame(deepcallc_x), verbose=0)
 
+        clear_session()
+        gc.collect()
         return ret_preds_shape
 
 
@@ -814,7 +888,8 @@ class DeepLC():
                    calibrate=True,
                    seq_df=None,
                    correction_factor=1.0,
-                   mod_name=None):
+                   mod_name=None,
+                   X_custom_list=None):
         """
         Make predictions for sequences, in batches if required.
 
@@ -850,7 +925,8 @@ class DeepLC():
                                         calibrate=calibrate,
                                         seq_df=seq_df,
                                         correction_factor=correction_factor,
-                                        mod_name=mod_name)
+                                        mod_name=mod_name,
+                                        X_custom_list=X_custom_list)
         else:
             ret_preds = []
             if len(seqs) > 0:
@@ -864,13 +940,15 @@ class DeepLC():
                     calibrate=calibrate,
                     seq_df=seq_df_t,
                     correction_factor=correction_factor,
-                    mod_name=mod_name)
+                    mod_name=mod_name,
+                    X_custom_list=X_custom_list)
                 ret_preds.extend(temp_preds)
 
                 # if self.verbose:
                 logger.debug(
                     "Finished predicting retention time for: %s/%s" %
                     (len(ret_preds), len(seq_df)))
+
             return ret_preds
 
     def calibrate_preds_func_pygam(self,
@@ -881,14 +959,16 @@ class DeepLC():
                                    correction_factor=1.0,
                                    seq_df=None,
                                    use_median=True,
-                                   mod_name=None):
+                                   mod_name=None,
+                                   X_custom_list=None):
         if len(seqs) == 0:
             seq_df.index
             predicted_tr = self.make_preds(
                 seq_df=seq_df,
                 calibrate=False,
                 correction_factor=correction_factor,
-                mod_name=mod_name)
+                mod_name=mod_name,
+                X_custom_list=X_custom_list)
             measured_tr = seq_df["tr"]
         else:
             predicted_tr = self.make_preds(
@@ -897,7 +977,8 @@ class DeepLC():
                 identifiers=identifiers,
                 calibrate=False,
                 correction_factor=correction_factor,
-                mod_name=mod_name)
+                mod_name=mod_name,
+                X_custom_list=X_custom_list)
 
         # sort two lists, predicted and observed based on measured tr
         tr_sort = [(mtr, ptr) for mtr, ptr in sorted(
@@ -918,7 +999,8 @@ class DeepLC():
                              correction_factor=1.0,
                              seq_df=None,
                              use_median=True,
-                             mod_name=None):
+                             mod_name=None,
+                             X_custom_list=None):
         """
         Make calibration curve for predictions
 
@@ -965,7 +1047,8 @@ class DeepLC():
                 seq_df=seq_df,
                 calibrate=False,
                 correction_factor=correction_factor,
-                mod_name=mod_name)
+                mod_name=mod_name,
+                X_custom_list=X_custom_list)
             measured_tr = seq_df["tr"]
         else:
             predicted_tr = self.make_preds(
@@ -974,7 +1057,8 @@ class DeepLC():
                 identifiers=identifiers,
                 calibrate=False,
                 correction_factor=correction_factor,
-                mod_name=mod_name)
+                mod_name=mod_name,
+                X_custom_list=X_custom_list)
 
         # sort two lists, predicted and observed based on measured tr
         tr_sort = [(mtr, ptr) for mtr, ptr in sorted(
@@ -1075,6 +1159,7 @@ class DeepLC():
                         measured_tr=[],
                         correction_factor=1.0,
                         seq_df=None,
+                        check_df=None,
                         use_median=True):
         """
         Find best model and calibrate.
@@ -1096,6 +1181,9 @@ class DeepLC():
         seq_df : object :: pd.DataFrame
             a pd.DataFrame that contains the sequences, modifications and
             observed retention times to fit a calibration curve
+        check_df : object :: pd.DataFrame
+            a pd.DataFrame that contains the sequences, modifications and
+            observed retention times to estimate the best model
         use_median : boolean
             flag to indicate we need to use the median valuein a window to
             perform calibration
@@ -1125,7 +1213,30 @@ class DeepLC():
         pred_dict = {}
         mod_dict = {}
 
-        for m in self.model:
+        all_models = copy.deepcopy(self.model)
+
+
+
+        write_library_BU = self.write_library
+        use_library_BU = self.use_library
+        reload_library_BU = self.reload_library
+
+        self.write_library=False
+        self.use_library=None
+        self.reload_library=False
+
+
+        X_custom_list_base = self.extract_custom(seq_df)
+        if check_df is None:
+            check_df = seq_df
+            X_custom_list_check = X_custom_list_base
+        else:
+            X_custom_list_check = self.extract_custom(check_df)
+
+        for m in all_models:
+
+            self.model = [m, ]
+
             if self.verbose:
                 logger.debug("Trying out the following model: %s" % (m))
             if self.pygam_calibration:
@@ -1137,7 +1248,8 @@ class DeepLC():
                     correction_factor=correction_factor,
                     seq_df=seq_df,
                     use_median=use_median,
-                    mod_name=m)
+                    mod_name=m,
+                    X_custom_list=X_custom_list_base)
             else:
                 calibrate_output = self.calibrate_preds_func(
                     seqs=seqs,
@@ -1147,21 +1259,23 @@ class DeepLC():
                     correction_factor=correction_factor,
                     seq_df=seq_df,
                     use_median=use_median,
-                    mod_name=m)
+                    mod_name=m,
+                    X_custom_list=X_custom_list_base)
 
             self.calibrate_min, self.calibrate_max, self.calibrate_dict = calibrate_output
 
             if type(self.calibrate_dict) == dict:
                 if len(self.calibrate_dict.keys()) == 0:
                     continue
-
             preds = self.make_preds(seqs=seqs,
                                     mods=mods,
                                     identifiers=identifiers,
                                     calibrate=True,
-                                    seq_df=seq_df,
+                                    seq_df=check_df,
                                     correction_factor=correction_factor,
-                                    mod_name=m)
+                                    mod_name=m,
+                                    X_custom_list=X_custom_list_check)
+
             m_name = m.split("/")[-1]
 
             if self.deepcallc_mod:
@@ -1191,12 +1305,16 @@ class DeepLC():
         for m_name in pred_dict.keys():
             preds = [sum(a)/len(a) for a in zip(*list(pred_dict[m_name].values()))]
             if len(measured_tr) == 0:
-                perf = sum(abs(seq_df["tr"] - preds))
+                # perf = sum(abs(seq_df["tr"] - preds))
+                rt_diff_tmp = check_df["tr"] - preds
             else:
-                perf = sum(abs(measured_tr - preds))
+                # perf = sum(abs(measured_tr - preds))
+                rt_diff_tmp = measured_tr - preds
+
+            _, perf, _ = calibrate_RT_gaus_full(rt_diff_tmp)
 
             if self.verbose:
-                logger.debug(
+                logger.info(
                     "For %s model got a performance of: %s" %
                     (m_name, perf / len(preds)))
 
@@ -1205,14 +1323,18 @@ class DeepLC():
                     m_group_name = "deepcallc"
                 else:
                     m_group_name = m_name
-                    # TODO is deepcopy really required?
 
-                best_calibrate_dict = copy.deepcopy(mod_calibrate_dict[m_group_name])
-                best_calibrate_min = copy.deepcopy(mod_calibrate_min_dict[m_group_name])
-                best_calibrate_max = copy.deepcopy(mod_calibrate_max_dict[m_group_name])
 
-                best_model = copy.deepcopy(mod_dict[m_group_name])
+                best_model_name = m_group_name
                 best_perf = perf
+
+        # TODO is deepcopy really required?
+        best_calibrate_dict = copy.deepcopy(mod_calibrate_dict[best_model_name])
+        best_calibrate_min = copy.deepcopy(mod_calibrate_min_dict[best_model_name])
+        best_calibrate_max = copy.deepcopy(mod_calibrate_max_dict[best_model_name])
+
+        best_model = copy.deepcopy(mod_dict[best_model_name])
+
 
         self.calibrate_dict = best_calibrate_dict
         self.calibrate_min = best_calibrate_min
@@ -1224,6 +1346,10 @@ class DeepLC():
 
 
         logger.debug("Model with the best performance got selected: %s" %(best_model))
+
+        self.write_library = write_library_BU
+        self.use_library = use_library_BU
+        self.reload_library = reload_library_BU
 
 
     def split_seq(self,
