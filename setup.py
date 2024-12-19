@@ -48,7 +48,7 @@ setup(
         'matplotlib>=3,<4',
         'h5py>=2.10.0,<4',
         'pygam>=0.8.0,<1',
-        'scikit-learn>=0.24.0,<2',
+        'scikit-learn>=0.24.0,<1.6.0',
         'deeplcretrainer>=0.1,<1',
         'psm_utils>=0.2.3,<1',
         'hdf5plugin>=4.1.1'
