@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name='deeplc',
-    version='1.1.2.4',
+    version='1.1.2.5',
     license='apache-2.0',
     description='DeepLC: Retention time prediction for (modified) peptides using Deep Learning.',
     long_description=LONG_DESCRIPTION,
@@ -48,7 +48,7 @@ setup(
         'matplotlib>=3,<4',
         'h5py>=2.10.0,<4',
         'pygam>=0.8.0,<1',
-        'scikit-learn>=0.24.0,<2',
+        'scikit-learn>=0.24.0,<=1.5.2',
     ],
     extras_require={
         "gui": ["gooey>=1.0"],
