@@ -42,7 +42,7 @@ setup(
     install_requires=[
         'setuptools>=42.0.1',
         'tensorflow>=2.2,<2.13',
-        'scipy>=1.4.1,<2',
+        'scipy>=1.11.4,<1.11.5',
         'numpy>=1.17,<2',
         'pandas>=0.25,<2',
         'matplotlib>=3,<4',
