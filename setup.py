@@ -1,15 +1,12 @@
 from setuptools import find_packages, setup
 
-with open("README.md", "r") as fh:
-    LONG_DESCRIPTION = fh.read()
-
 
 setup(
     name='deeplc',
     version='2.2.9',
     license='apache-2.0',
     description='DeepLC: Retention time prediction for (modified) peptides using Deep Learning.',
-    long_description=LONG_DESCRIPTION,
+    long_description="No description",
     long_description_content_type="text/markdown",
     author='Robbin Bouwmeester, Niels Hulstaert, Arthur Declercq, Ralf Gabriels, Prof. Lennart Martens, Prof. Sven Degroeve',
     author_email='Robbin.Bouwmeester@UGent.be',
