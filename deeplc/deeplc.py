@@ -61,6 +61,8 @@ if IS_CLI_GUI or IS_FROZEN:
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+#TF in WSL fix
+tf.config.set_visible_devices([], "GPU")
 from tensorflow.keras.models import load_model
 
 from deeplc._exceptions import CalibrationError, DeepLCError
